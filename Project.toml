@@ -1,0 +1,9 @@
+[deps]
+CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
+Circuitscape = "2b7a1792-8151-5239-925d-e2b8fdfa3201"
+HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
+LandscapeMetrics = "25862bd7-db54-4647-9101-56547424702b"
+Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
+Omniscape = "a38d70fc-99f5-11e9-1e3d-cbca093024c3"
+SpeciesDistributionToolkit = "72b53823-5c0b-4575-ad0e-8e97227ad13b"
+ZipArchives = "49080126-0e18-4c2a-b176-c102e4b3760c"

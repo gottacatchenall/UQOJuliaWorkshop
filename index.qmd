@@ -1,0 +1,629 @@
+---
+title: "Connectivity Workshop"
+format: 
+    html: 
+        code-fold: false
+jupyter: julia-1.12
+---
+
+```{julia}
+using Pkg
+Pkg.activate(@__DIR__)
+using SpeciesDistributionToolkit
+using CairoMakie
+const SDT = SpeciesDistributionToolkit
+
+using Logging
+global_logger(ConsoleLogger(stderr, Logging.Warn))
+
+```
+
+## Getting city boundaries as polygons with SDT
+
+Fetch polygon boundaries from OpenStreetMap.
+
+```{julia}
+gatineau = getpolygon(PolygonData(OpenStreetMap, Places), place = "Gatineau")
+ottawa   = getpolygon(PolygonData(OpenStreetMap, Places), place = "Ottawa")
+```
+
+Combine while maintaining separate features.
+
+```{julia}
+metro_region = vcat(ottawa, gatineau)
+```
+
+Combine into a single polygon.
+
+```{julia}
+ottawa + gatineau
+```
+
+Quick visualization.
+
+```{julia}
+fig = Figure()
+ax1, ax2 = Axis(fig[1,1], aspect=DataAspect()), Axis(fig[1,2], aspect=DataAspect())
+poly!(ax1, metro_region)
+poly!(ax2, ottawa + gatineau)
+fig
+```
+
+Extract the bounding box as a named tuple.
+
+```{julia}
+SDT.boundingbox(metro_region)
+```
+
+## Acquiring land cover data with SDT
+
+The `RasterData` interface is used for all types of data from SDT. The pattern is `RasterData(SOURCE, DATA_TYPE)`.
+
+All available data sources are subtypes of `RasterProvider`. To list all sources:
+
+```{julia}
+subtypes(RasterProvider)
+```
+
+Here we'll use EarthEnv, a database of environmental data. Each `RasterProvider` provides one or more `RasterDataset`s, which correspond to particular types of data. We can list all of the different `RasterDataset`s available across all providers via:
+
+```{julia}
+subtypes(RasterDataset)
+```
+
+`RasterProvider`s do not typically provide every type of data, so we can use the following to determine what datasets are available from a particular provider. For example, this lists the datasets available from EarthEnv:
+
+```{julia}
+[ds for ds in subtypes(RasterDataset) if SimpleSDMDatasets.provides(EarthEnv, ds)]
+```
+
+An alternative way of doing this with traditional for loops:
+
+```{julia}
+for ds in subtypes(RasterDataset)
+    if SimpleSDMDatasets.provides(EarthEnv, ds)
+        println("EarthEnv provides $ds")
+    end
+end
+```
+
+We will focus on the LandCover data provided by EarthEnv. We combine a `RasterProvider` and `RasterDataset` using the `RasterData` type:
+
+```{julia}
+dataset = RasterData(EarthEnv, LandCover)
+```
+
+Many datasets provide multiple raster layers. We can list them with the `layers` method.
+
+```{julia}
+landcover_types = layers(dataset)
+```
+
+To load a layer we use the `SDMLayer` method. By default this loads the full extent of the first layer — a 17500 × 43200 pixel raster covering the whole Earth. We crop to our region of interest by passing the bounding box as keyword arguments. For example, to select the region between -90° and -85° longitude and 45° to 50° latitude:
+
+```{julia}
+SDMLayer(dataset; left = -90, right = -85, bottom = 45, top = 50)
+```
+
+We can also select a specific layer by passing its name as the `layer` keyword argument.
+
+```{julia}
+SDMLayer(dataset; layer = "Evergreen Broadleaf Trees", left = -90, right = -85, bottom = 45, top = 50)
+```
+
+For Ottawa/Gatineau we use the `SDT.boundingbox` method from earlier.
+
+```{julia}
+deciduous = SDMLayer(dataset; layer = "Deciduous Broadleaf Trees", SDT.boundingbox(metro_region)...)
+```
+
+Let's visualize it.
+
+```{julia}
+fig = Figure()
+ax = Axis(fig[1,1])
+hm = heatmap!(ax, deciduous)
+Colorbar(fig[1,2], hm, label="Percent Deciduous Broadleaf Tree")
+fig
+```
+
+This gives a score between 0 and 100 representing the percent of a pixel covered in deciduous broadleaf trees. Note that it covers the full bounding box of the region, not just the area inside the polygon. To mask cells outside the polygon we use `mask!`.
+
+```{julia}
+mask!(deciduous, metro_region)
+```
+
+We can visualize again to confirm.
+
+```{julia}
+fig = Figure()
+ax = Axis(fig[1,1])
+hm = heatmap!(ax, deciduous)
+Colorbar(fig[1,2], hm, label="Percent Deciduous Broadleaf Tree")
+fig
+```
+
+For connectivity modeling we want a land cover map where each pixel is assigned a single discrete land cover type — the one most prominent in that pixel. The first step is to load the proportion cover for each category. Here's one way using an inline loop:
+
+```{julia}
+stack = [
+    SDMLayer(dataset;
+        layer  = layer,
+        SDT.boundingbox(metro_region)...
+    )
+    for layer in landcover_types
+]
+```
+
+And an alternative using a traditional for loop:
+
+```{julia}
+stack = SDMLayer[]
+for layer in landcover_types
+    this_layer = SDMLayer(dataset; layer = layer, SDT.boundingbox(metro_region)...)
+    push!(stack, this_layer)
+end
+```
+
+We can apply `mask!` to the whole vector to include only cells within the region of interest.
+
+```{julia}
+mask!(stack, metro_region)
+```
+
+Let's plot to get a glimpse of how multipanel plots work.
+
+```{julia}
+fig = Figure(size = (900, 900))
+grid = GridLayout(fig[1,1])
+grid_locations = CartesianIndices((1:4, 1:3))
+for (i, cart_idx) in enumerate(grid_locations)
+    ax = Axis(grid[cart_idx[1], cart_idx[2]], title = landcover_types[i])
+    hidedecorations!(ax)
+    hidespines!(ax)
+    heatmap!(ax, stack[i], colorrange=(0,100))
+end
+fig
+```
+
+Now we'll build a single consensus map by assigning each pixel the land cover type with the highest coverage. We use `mosaic`, which takes a function and a vector of raster layers and returns a layer formed by applying that function across layers at each cell. Here we use `argmax`, which returns the index of the layer with the highest value — i.e., the most prominent land cover type.
+
+```{julia}
+consensus = mosaic(argmax, stack)
+```
+
+First we define colors that clearly correspond to the land cover classes.
+
+```{julia}
+landcover_colors = [
+    colorant"#117733",   # Needleleaf / Evergreen forest
+    colorant"#668822",   # Broadleaf deciduous
+    colorant"#99BB55",   # Mixed forest
+    colorant"#55aa22",   # Shrubland
+    colorant"#ddcc66",   # Grassland
+    colorant"#aaddcc",   # Wetland
+    colorant"#44aa88",   # Cropland
+    colorant"#88bbaa",   # Barren / Sparse vegetation
+    colorant"#bb0011",   # Urban
+    :aqua,               # Water
+    colorant"#FFEE88",   # Snow/Ice
+    colorant"#5566AA",   # Other
+]
+```
+
+And now we plot with a legend.
+
+```{julia}
+fig = Figure(; size = (900, 700))
+panel = Axis(fig[1, 1]; xlabel = "Easting", ylabel = "Northing", aspect = DataAspect())
+hidedecorations!(panel)
+hidespines!(panel)
+heatmap!(panel, consensus; colormap = landcover_colors)
+lines!(panel, metro_region; color = :black, linewidth = 1.5)
+Legend(
+    fig[2, 1],
+    [PolyElement(; color = landcover_colors[i]) for i in eachindex(landcover_colors)],
+    landcover_types;
+    orientation = :horizontal, nbanks = 4, framevisible = false
+)
+fig
+```
+
+Before running connectivity analysis, let's demonstrate how we can use polygons to compute land cover statistics for each city. There is a fair amount going on here — the point is just to show how complex operations can be expressed concisely.
+
+```{julia}
+function count_area(x)
+    lc_types = sort(unique(x))
+    cell_counts = map(lc->count(isequal(lc), x), lc_types)
+    return [landcover_types[lc] for lc in lc_types], [cell_counts[i] / sum(cell_counts) for i in eachindex(lc_types)]
+end
+
+cities = [x.properties[:name] for x in metro_region]
+cover_by_city = Dict([metro_region[i].properties[:name] => x for (i,x) in byzone(count_area, consensus, [metro_region...])])
+```
+
+Now we can plot as a side-by-side bar chart by putting this data in a table that works well with Makie's bar plots.
+
+```{julia}
+tbl = (
+    cat = vcat([[i for i in eachindex(cover_by_city[k][1])] for k in cities]...),
+    height = vcat([cover_by_city[c][2] for c in cities]...),
+    grp = vcat([[i for j in eachindex(cover_by_city[c][1])] for (i,c) in enumerate(cities)]...)
+)
+
+fig = Figure()
+ax = Axis(fig[1,1], xticks = (1:length(cover_by_city[cities[begin]][1]), cover_by_city[cities[begin]][1]), xticklabelsize = 10, xticklabelrotation=2.5π, ylabel = "Proportion of Region")
+barplot!(ax,
+    tbl.cat,
+    tbl.height,
+    dodge = tbl.grp,
+    color = tbl.grp,
+    colormap = [:dodgerblue, :forestgreen]
+)
+axislegend(ax, [PolyElement(color=:dodgerblue), PolyElement(color=:forestgreen)], cities)
+fig
+```
+
+## Circuitscape
+
+For our first connectivity analysis, we'll use Circuitscape to do a pairwise analysis of connectivity between patches of forest habitat.
+
+Let's load the package.
+
+```{julia}
+using Circuitscape
+```
+
+We'll use deciduous trees as the focal land cover of interest.
+
+```{julia}
+target_type = "Deciduous Broadleaf Trees"
+target_label = findfirst(isequal(target_type), landcover_types)
+```
+
+The function below labels individual, contiguous patches of forest habitat. We'll use these patch IDs as focal nodes for Circuitscape's pairwise mode.
+
+```{julia}
+function find_patches(landcover, target::Integer)
+    neighbors = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
+
+    nrows, ncols = size(landcover)
+    matrix = landcover.grid
+    result = fill(-1, nrows, ncols)
+    visited = falses(nrows, ncols)
+    patch_id = 1
+
+    for i in 1:nrows, j in 1:ncols
+        matrix[i, j] == target && !visited[i, j] || continue
+
+        patch_id += 1
+        queue = [(i, j)]
+        visited[i, j] = true
+
+        while !isempty(queue)
+            r, c = popfirst!(queue)
+            result[r, c] = patch_id
+            for (dr, dc) in neighbors
+                nr, nc = r + dr, c + dc
+                if checkbounds(Bool, matrix, nr, nc) && matrix[nr, nc] == target && !visited[nr, nc]
+                    visited[nr, nc] = true
+                    push!(queue, (nr, nc))
+                end
+            end
+        end
+    end
+    patches = copy(landcover)
+    patches.grid .= result
+    patches.indices[findall(isequal(-1), result)] .= 0
+    return patches
+end
+```
+
+Now we'll use this function to label all the patches of deciduous forest.
+
+```{julia}
+patches = find_patches(consensus, target_label)
+```
+
+Plot to verify.
+
+```{julia}
+fig = Figure()
+ax = Axis(fig[1,1])
+heatmap!(ax, consensus, colormap=[:grey90])
+heatmap!(ax, patches)
+fig
+```
+
+Next we'll create a resistance map by assigning each land cover class a resistance value.
+
+```{julia}
+resistance_values = Dict(
+    "Evergreen/Deciduous Needleleaf Trees" => 1,
+    "Evergreen Broadleaf Trees" => 1,
+    "Deciduous Broadleaf Trees" => 1,
+    "Mixed/Other Trees" => 1,
+    "Shrubs" => 3,
+    "Herbaceous Vegetation" => 3,
+    "Cultivated and Managed Vegetation" => 10,
+    "Regularly Flooded Vegetation" => 20,
+    "Urban/Built-up" => 50,
+    "Snow/Ice" => 50,
+    "Barren" => 50,
+    "Open Water" => 50
+)
+```
+
+Create the resistance map by substituting each pixel's land cover index with its corresponding resistance value.
+
+```{julia}
+resistance = copy(consensus)
+for i in eachindex(consensus)
+    resistance[i] = resistance_values[landcover_types[consensus[i]]]
+end
+
+heatmap(resistance)
+```
+
+Circuitscape only runs using configurations defined in `.ini` files, so we need to write our input data in the expected ASCII raster format. The function below converts an `SDMLayer` to that format.
+
+```{julia}
+function write_raster(raster, output_path)
+    open(output_path, "w") do io
+        nrows, ncols = size(raster.grid)
+        xll = raster.x[1]
+        yll = raster.y[1]
+        dx  = (raster.x[2] - raster.x[1]) / ncols
+
+        println(io, "ncols         $ncols")
+        println(io, "nrows         $nrows")
+        println(io, "xllcorner     $xll")
+        println(io, "yllcorner     $yll")
+        println(io, "cellsize      $dx")
+        println(io, "NODATA_value  -9999")
+
+        raster.grid[findall(iszero, raster.indices)] .= -9999
+        for row in eachrow(raster.grid)
+            println(io, join(row, " "))
+        end
+    end
+end
+```
+
+Write the resistance map and the patch map to files.
+
+```{julia}
+write_raster(resistance, joinpath("circuitscape_inputs", "resistance.asc"))
+write_raster(patches, joinpath("circuitscape_inputs", "patches.asc"))
+```
+
+Run Circuitscape.
+
+```{julia}
+#| output: false
+Circuitscape.compute(joinpath("circuitscape_inputs", "config.ini"));
+```
+
+Circuitscape produces two outputs of note: a cumulative current map and a pairwise resistance matrix. The functions below load these back into Julia.
+
+```{julia}
+function load_cumulative_current(path, resistance)
+    open(path) do f
+        header = Dict()
+        data_start = 0
+
+        for (i, line) in enumerate(eachline(f))
+            parts = split(strip(line))
+            if length(parts) == 2
+                header[lowercase(parts[1])] = parts[2]
+            else
+                data_start = i
+                break
+            end
+        end
+        nrows  = parse(Int,     header["nrows"])
+        ncols  = parse(Int,     header["ncols"])
+        nodata = parse(Float32, header["nodata_value"])
+
+        seekstart(f)
+        for _ in 1:data_start - 1
+            readline(f)
+        end
+
+        grid = Matrix(undef, nrows, ncols)
+        for i in 1:nrows
+            vals = split(strip(readline(f)))
+            for j in 1:ncols
+                v = parse(Float32, vals[j])
+                grid[i, j] = v == nodata ? nodata : v
+            end
+        end
+
+        cumcurrent = copy(Float32.(resistance))
+        cumcurrent.grid .= grid
+        cumcurrent.indices[findall(isequal(nodata), cumcurrent.grid)] .= 0
+
+        return cumcurrent
+    end
+end
+
+using DelimitedFiles
+
+function load_pairwise_resistance(path)
+    mat = readdlm(path, ' ', Float64)
+    mat[2:end, 2:end]
+end
+```
+
+Load the outputs.
+
+```{julia}
+cumulative_current  = load_cumulative_current(joinpath("circuitscape_inputs", "circuitscape_cum_curmap.asc"), resistance)
+pairwise_resistances = load_pairwise_resistance(joinpath("circuitscape_inputs", "circuitscape_resistances_3columns.out"))
+```
+
+Visualize the cumulative current map, with patches overlaid.
+
+```{julia}
+fig = Figure()
+ax = Axis(fig[1,1])
+heatmap!(ax, cumulative_current)
+heatmap!(ax, patches, colormap=[:grey10])
+fig
+```
+
+## Omniscape
+
+Now we'll use Omniscape to compute omnidirectional connectivity.
+
+```{julia}
+using Omniscape
+
+function convert_resistance_to_omniscape(resistance)
+    missing_idx = findall(.!resistance.indices)
+    mat = Matrix{Union{Float64,Missing}}(resistance.grid)
+    mat[missing_idx] .= missing
+    return mat
+end
+
+omni_resist = convert_resistance_to_omniscape(resistance)
+
+config = Dict{String, String}(
+    "radius"                  => "50",
+    "block_size"              => "1",
+    "suppress_cs_messages"    => "true",
+    "source_from_resistance"  => "true",
+    "r_cutoff"                => "1",
+    "reclassify_resistance"   => "false",
+    "correct_artifacts"       => "false",
+    "calc_normalized_current" => "true",
+    "calc_flow_potential"     => "true",
+    "project_name"            => "test",
+    "write_outputs"           => "true",
+    "parallelize"             => "false",
+    "solver"                  => "cholmod",
+)
+```
+
+```{julia}
+global_logger(ConsoleLogger(stderr, Logging.Warn))
+currmap, flow_pot, norm_current = run_omniscape(config, omni_resist)
+```
+
+Convert the matrix outputs back to `SDMLayer`s for plotting.
+
+```{julia}
+function convert_to_sdmlayer(matrix, resistance)
+    valid_idx = findall(!ismissing, matrix)
+    layer = copy(Float64.(resistance))
+    layer.grid[valid_idx] .= matrix[valid_idx]
+    return layer
+end
+
+current_map        = convert_to_sdmlayer(currmap, resistance)
+flow_potential     = convert_to_sdmlayer(flow_pot, resistance)
+normalized_current = convert_to_sdmlayer(norm_current, resistance)
+
+heatmap(currmap)
+heatmap(normalized_current)
+```
+
+## A Bigger Raster
+
+Now we're ready to run a larger connectivity analysis. We'll use a pre-prepared land cover layer at a higher resolution (30 × 30 meter pixels) to avoid downloading 20 GB+ of data all at once.
+
+```{julia}
+landcover = SDMLayer(joinpath("data", "landcover.tif"))
+```
+
+This dataset uses a slightly different set of land cover classes.
+
+```{julia}
+landcover_types = [
+    "Needleleaf forest",
+    "Broadleaf deciduous forest",
+    "Mixed Forest",
+    "Shrubland",
+    "Grassland",
+    "Wetland",
+    "Cropland",
+    "Barren lands",
+    "Urban",
+    "Water",
+]
+```
+
+Define colors for each land cover type and plot.
+
+```{julia}
+landcover_colors = [
+    colorant"#117733",   # Needleleaf forest
+    colorant"#668822",   # Broadleaf deciduous
+    colorant"#55aa22",   # Mixed Forest
+    colorant"#a9cb99",   # Shrubland
+    colorant"#ddcc66",   # Grassland
+    colorant"#aaddcc",   # Wetland
+    colorant"#d5925f",   # Cropland
+    colorant"#c2c0b2",   # Barren
+    colorant"#bb0011",   # Urban
+    colorant"#5566AA",   # Water
+]
+
+fig = Figure(; size = (900, 700))
+panel = Axis(fig[1, 1]; aspect = DataAspect())
+hidedecorations!(panel); hidespines!(panel)
+heatmap!(panel, landcover; colormap = landcover_colors)
+lines!(panel, metro_region; color = :black)
+Legend(fig[2, 1],
+    [PolyElement(; color = landcover_colors[i]) for i in eachindex(landcover_colors)],
+    landcover_types; orientation = :horizontal, nbanks = 4)
+fig
+```
+
+The higher resolution reveals considerably more spatial detail, which will be useful for connectivity analysis. Assign resistance values and build the resistance layer.
+
+```{julia}
+resistance_values = Dict(
+    "Needleleaf forest"          => 1,
+    "Broadleaf deciduous forest" => 1,
+    "Mixed Forest"               => 1,
+    "Shrubland"                  => 5,
+    "Grassland"                  => 5,
+    "Wetland"                    => 10,
+    "Cropland"                   => 10,
+    "Barren lands"               => 10,
+    "Urban"                      => 50,
+    "Water"                      => 50,
+)
+
+resistance = copy(Float32.(landcover))
+for i in eachindex(landcover)
+    resistance[i] = resistance_values[landcover_types[landcover[i]]]
+end
+
+omni_resist = convert_resistance_to_omniscape(resistance)
+
+config = Dict{String, String}(
+    "radius"                  => "30",
+    "block_size"              => "3",
+    "suppress_cs_messages"    => "true",
+    "source_from_resistance"  => "true",
+    "r_cutoff"                => "1",
+    "reclassify_resistance"   => "false",
+    "correct_artifacts"       => "false",
+    "calc_normalized_current" => "true",
+    "calc_flow_potential"     => "true",
+    "project_name"            => "test",
+    "write_outputs"           => "true",
+    "parallelize"             => "false",
+    "solver"                  => "cholmod",
+)
+```
+
+```{julia}
+#| eval: false
+#| 
+currmap, flow_pot, norm_current = run_omniscape(config, omni_resist)
+heatmap(norm_current)
+```
+
